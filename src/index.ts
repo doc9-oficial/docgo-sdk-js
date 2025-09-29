@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import * as yaml from "js-yaml";
 // Fallback para fetch em Node < 18
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const fetchFn: any = (globalThis as any).fetch || require("node-fetch");
@@ -18,7 +19,7 @@ interface MCPToolDefinition {
 interface FunctionDef {
   script: string;
   description: string;
-  parameters: ParameterDef[];
+  params: ParameterDef[];
   mcp?: MCPToolDefinition;
 }
 
@@ -34,11 +35,22 @@ interface Manifest {
   version: string;
   description: string;
   functions: Record<string, FunctionDef>;
-  variables: Record<string, string>;
-  mcp?: {
-    enabled: boolean;
-    tools: MCPToolDefinition[];
-  };
+  config?: Record<string, any>;
+  mcp?: boolean;
+}
+
+interface ConfigEnvVar {
+  name: string;
+  value: string;
+}
+
+interface ConfigApp {
+  name: string;
+  env?: ConfigEnvVar[];
+}
+
+interface ConfigFile {
+  apps?: ConfigApp[];
 }
 
 export class DocGoLib {
@@ -46,6 +58,7 @@ export class DocGoLib {
   private functionName: string | undefined;
   private params: any[];
   private _manifest: Manifest | null = null;
+  private _config: ConfigFile | null = null;
 
   constructor() {
     // 1. Carregar .env (raiz/projeto e diretório atual) se ainda não carregado
@@ -163,17 +176,78 @@ export class DocGoLib {
     return this._manifest;
   }
 
+  // Carrega o config.yml
+  get config(): ConfigFile | null {
+    if (!this._config) {
+      try {
+        // Procurar config.yml no diretório do executável (bin/)
+        const configPath = this.findConfigFile();
+        if (configPath) {
+          const data = fs.readFileSync(configPath, "utf8");
+          this._config = yaml.load(data) as ConfigFile;
+          if (process.env.DOCGO_DEBUG === "1") {
+            console.log(`[docgo-sdk][debug] config loaded from:`, configPath);
+            console.log(`[docgo-sdk][debug] config content:`, this._config);
+          }
+        }
+      } catch (error) {
+        if (process.env.DOCGO_DEBUG === "1") {
+          console.log(`[docgo-sdk][debug] config not found or error:`, error);
+        }
+      }
+    }
+    return this._config;
+  }
+
+  // Procura o arquivo config.yml
+  private findConfigFile(): string | undefined {
+    // 1. Tentar no diretório do executável (bin/)
+    const execPath = process.env.DOCGO_EXEC_PATH || process.argv[0];
+    if (execPath) {
+      const execDir = path.dirname(execPath);
+      const configPath = path.join(execDir, "config.yml");
+      if (fs.existsSync(configPath)) {
+        return configPath;
+      }
+    }
+
+    // 2. Tentar no diretório atual
+    const currentConfig = path.join(process.cwd(), "config.yml");
+    if (fs.existsSync(currentConfig)) {
+      return currentConfig;
+    }
+
+    // 3. Tentar no diretório do manifest
+    if (this.manifestPath) {
+      const manifestDir = path.dirname(this.manifestPath);
+      const configPath = path.join(manifestDir, "config.yml");
+      if (fs.existsSync(configPath)) {
+        return configPath;
+      }
+    }
+
+    return undefined;
+  }
+
   // Obtém variável do manifest
   getVariable(key: string): string | null {
-    if (this.manifest?.variables) {
-      return this.manifest.variables[key];
+    if (this.manifest?.config && this.manifest.config[key] !== undefined) {
+      return String(this.manifest.config[key]);
     }
     return null;
   }
 
   // Obtém todas as variáveis
   getAllVariables(): Record<string, string> {
-    return this.manifest?.variables || {};
+    const result: Record<string, string> = {};
+
+    if (this.manifest?.config) {
+      for (const [key, value] of Object.entries(this.manifest.config)) {
+        result[key] = String(value);
+      }
+    }
+
+    return result;
   }
 
   // Obtém configuração da função atual
@@ -189,7 +263,9 @@ export class DocGoLib {
     const func = this.getCurrentFunction();
     if (!func) return { valid: false, error: "Function not found" };
 
-    const required = func.parameters.filter((p) => p.required);
+    const parameters = func.params || [];
+    const required = parameters.filter((p) => p.required);
+
     if (this.params.length < required.length) {
       return {
         valid: false,
@@ -207,8 +283,9 @@ export class DocGoLib {
     }
 
     const func = this.getCurrentFunction();
-    if (func?.parameters) {
-      const index = func.parameters.findIndex((p) => p.name === indexOrName);
+    if (func) {
+      const parameters = func.params || [];
+      const index = parameters.findIndex((p) => p.name === indexOrName);
       return index >= 0 ? this.params[index] : undefined;
     }
 
@@ -270,9 +347,50 @@ export class DocGoLib {
     return JSON.stringify(result, null, 2);
   }
 
-  // Acesso a variáveis de ambiente
+  // Acesso a variáveis de ambiente com resolução hierárquica
   getEnv(key: string, defaultValue: string | null = null): string | null {
+    // 1. Verificar config.yml primeiro
+    const configValue = this.getConfigValue(key);
+    if (configValue !== null) {
+      return configValue;
+    }
+
+    // 2. Fallback para variável de ambiente direta
     return process.env[key] || defaultValue;
+  }
+
+  // Obtém valor do config.yml com resolução de referências
+  private getConfigValue(key: string): string | null {
+    const config = this.config;
+    if (!config?.apps) {
+      return null;
+    }
+
+    // Encontrar o app atual
+    const appName = this.manifest?.name;
+    if (!appName) {
+      return null;
+    }
+
+    const app = config.apps.find((a) => a.name === appName);
+    if (!app?.env) {
+      return null;
+    }
+
+    // Encontrar a variável no config do app
+    const envVar = app.env.find((e) => e.name === key);
+    if (!envVar) {
+      return null;
+    }
+
+    // Se o valor começa com $, é uma referência a uma env
+    if (envVar.value.startsWith("$")) {
+      const envKey = envVar.value.substring(1);
+      return process.env[envKey] || null;
+    }
+
+    // Caso contrário, é um valor direto
+    return envVar.value;
   }
 
   // Helpers para trabalhar com APIs externas
@@ -335,10 +453,68 @@ export class DocGoLib {
     return response.json();
   }
 
-  // Obtém definição MCP da função
+  // Obtém definição MCP da função (gera automaticamente se não existir)
   getMCPDefinition(): MCPToolDefinition | null {
     const func = this.getCurrentFunction();
-    return func?.mcp || null;
+    if (!func) return null;
+
+    // Se já existe definição MCP, retorna ela
+    if (func.mcp) return func.mcp;
+
+    // Gera automaticamente a partir dos parâmetros
+    const parameters = func.params || [];
+    if (parameters.length === 0) return null;
+
+    const properties: Record<string, any> = {};
+    const required: string[] = [];
+
+    for (const param of parameters) {
+      let schemaType: any;
+
+      // Converter tipos simplificados para JSON Schema
+      if (param.type.endsWith("[]")) {
+        const baseType = param.type.slice(0, -2);
+        schemaType = {
+          type: "array",
+          items: { type: this.mapTypeToJsonSchema(baseType) },
+        };
+      } else {
+        schemaType = this.mapTypeToJsonSchema(param.type);
+      }
+
+      properties[param.name] = {
+        type: schemaType,
+        description: param.description,
+      };
+
+      if (param.required) {
+        required.push(param.name);
+      }
+    }
+
+    return {
+      name: this.functionName || "unknown_function",
+      description: func.description,
+      inputSchema: {
+        type: "object",
+        properties,
+        required,
+      },
+    };
+  }
+
+  // Mapeia tipos simplificados para JSON Schema
+  private mapTypeToJsonSchema(type: string): string {
+    switch (type) {
+      case "string":
+        return "string";
+      case "number":
+        return "number";
+      case "boolean":
+        return "boolean";
+      default:
+        return "string";
+    }
   }
 }
 
